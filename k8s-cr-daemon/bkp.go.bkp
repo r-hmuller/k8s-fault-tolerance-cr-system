@@ -1,0 +1,109 @@
+package main
+
+namespace := "default"
+ctx := namespaces.WithNamespace(context.Background(), namespace)
+containerdSocket := os.Getenv("CONTAINERD_SOCKET")
+if containerdSocket == "" {
+containerdSocket = "/run/containerd/containerd.sock"
+}
+
+client, err := containerd.New(containerdSocket, containerd.WithDefaultNamespace(namespace))
+defer client.Close()
+if err != nil {
+fmt.Println("Error creating containerd client")
+fmt.Println(err)
+os.Exit(1)
+}
+
+containers, err := client.Containers(ctx)
+if err != nil {
+fmt.Println("Error fetching containers")
+fmt.Println(err)
+os.Exit(1)
+}
+
+fmt.Printf("Containers in namespace %s:\n", namespace)
+fmt.Println(len(containers))
+for _, container := range containers {
+print(fmt.Println(container.Image(ctx)))
+
+}
+os.Exit(0)
+
+image, err := client.Pull(ctx, "docker.io/library/redis:alpine", containerd.WithPullUnpack)
+if err != nil {
+fmt.Println("Error pulling image")
+fmt.Println(err)
+os.Exit(1)
+}
+log.Printf("Successfully pulled %s image\n", image.Name())
+
+// create a container
+container, err := client.NewContainer(
+ctx,
+"redis-server-2",
+containerd.WithImage(image),
+containerd.WithNewSnapshot("redis-server-snapshot-3", image),
+containerd.WithNewSpec(oci.WithImageConfig(image)),
+)
+if err != nil {
+fmt.Println("Error creating container")
+fmt.Println(err)
+}
+defer container.Delete(ctx, containerd.WithSnapshotCleanup)
+
+// create a task from the container
+task, err := container.NewTask(ctx, cio.NewCreator(cio.WithStdio))
+if err != nil {
+fmt.Println("Error creating task")
+fmt.Println(err)
+os.Exit(1)
+}
+defer task.Delete(ctx)
+
+// make sure we wait before calling start
+exitStatusC, err := task.Wait(ctx)
+if err != nil {
+fmt.Println("Error waiting for task")
+fmt.Println(err)
+os.Exit(1)
+}
+
+// call start on the task to execute the redis server
+if err := task.Start(ctx); err != nil {
+fmt.Println("Error starting task")
+fmt.Println(err)
+os.Exit(1)
+}
+
+time.Sleep(2 * time.Second)
+
+snapshot, err := task.Checkpoint(ctx)
+if err != nil {
+fmt.Println("Error creating checkpoint")
+fmt.Println(err)
+} else {
+fmt.Println("Checkpoint created")
+fmt.Println(snapshot)
+fmt.Println(snapshot.Metadata())
+}
+
+time.Sleep(300 * time.Second)
+
+// kill the process and get the exit status
+if err := task.Kill(ctx, syscall.SIGTERM); err != nil {
+fmt.Println("Error killing task")
+fmt.Println(err)
+os.Exit(1)
+}
+
+// wait for the process to fully exit and print out the exit status
+
+status := <-exitStatusC
+code, _, err := status.Result()
+if err != nil {
+fmt.Println("Error getting exit status")
+fmt.Println(err)
+os.Exit(1)
+}
+fmt.Printf("redis-server exited with status: %d\n", code)

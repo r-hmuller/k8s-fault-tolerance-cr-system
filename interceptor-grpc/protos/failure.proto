@@ -1,0 +1,16 @@
+syntax = "proto3";
+
+option go_package = "github.com/rhmuller/interceptor-grpc/protos";
+
+package protos;
+
+service FailureService {
+  rpc StopRequests(RestoreRequest) returns (RestoreResponse) {}
+  rpc ReprocessRequests(RestoreRequest) returns (RestoreResponse) {}
+}
+
+message RestoreRequest {}
+
+message RestoreResponse {
+  bool message = 1;
+}

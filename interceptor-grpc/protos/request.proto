@@ -1,0 +1,29 @@
+syntax = "proto3";
+option go_package = "github.com/rhmuller/interceptor-grpc/protos";
+
+package protos;
+
+service SnapshotRPCService {
+  rpc Create(CreateSnapshotRequest) returns (AckResponse);
+  rpc Reply(ReplySnapshotRequest) returns (AckResponse);
+}
+
+message CreateSnapshotRequest{
+  string namespace = 1;
+  string serviceName = 2;
+  string registryName = 3;
+  uint64 latestRequest = 4;
+}
+
+message ReplySnapshotRequest {
+  string namespace = 1;
+  string serviceName = 2;
+  string registryName = 3;
+  string snapshotStatus = 4;
+  uint64 latestRequest = 5;
+}
+
+message AckResponse{
+  bool response = 1;
+  string error = 2;
+}

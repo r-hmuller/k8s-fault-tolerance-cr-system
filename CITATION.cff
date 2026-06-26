@@ -1,0 +1,10 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+title: "k8s-fault-tolerance-cr-system: Fault tolerance for stateful Kubernetes pods via checkpoint/restore"
+authors:
+  - family-names: "Müller"
+    given-names: "Rodrigo Herpich"
+repository-code: "https://github.com/r-hmuller/k8s-fault-tolerance-cr-system"
+url: "https://github.com/r-hmuller/k8s-fault-tolerance-cr-system"
+version: "1.0.0"
+date-released: "2026-06-26"
