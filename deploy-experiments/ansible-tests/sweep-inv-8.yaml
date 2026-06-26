@@ -1,0 +1,16 @@
+client_master:
+  hosts:
+    node1.example.net:
+  vars:
+    ansible_user: youruser
+client_nodes:
+  hosts:
+    node2.example.net:
+    node3.example.net:
+    node4.example.net:
+    node5.example.net:
+    node6.example.net:
+    node7.example.net:
+    node8.example.net:
+  vars:
+    ansible_user: youruser

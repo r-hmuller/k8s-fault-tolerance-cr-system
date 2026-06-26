@@ -1,0 +1,7 @@
+- name: Update client nodes
+  hosts: client_nodes,client_master
+  tasks:
+    - name: Upgrade all packages
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest

@@ -1,0 +1,69 @@
+- name: Run test on all clients (async)
+  hosts: client_master, client_nodes
+  vars:
+    num_threads: "{{ lookup('ansible.builtin.env', 'NUM_THREAD', default='16') }}"
+    num_clients: "{{ lookup('ansible.builtin.env', 'NUM_CLIENT', default='4') }}"
+    seconds: "{{ lookup('ansible.builtin.env', 'SECONDS_TO_RUN', default='800') }}"
+    server_url: "{{ lookup('ansible.builtin.env', 'SERVER_URL', default='http://10.10.1.2:30847') }}"
+    file_to_write: "{{ lookup('ansible.builtin.env', 'FILE_TO_WRITE', default='/users/youruser/resultados-fev26') }}"
+    main_client: "{{ 'True' if group_names[0] == 'client_master' else 'False' }}"
+    should_populate_database: False
+    debug_response: False
+    thinking_time: "0.01"
+    save_all_requests: False
+    reproduce_requests: False
+    file_to_write_requests: "{{ lookup('ansible.builtin.env', 'FILE_TO_WRITE_REQUESTS', default='/users/youruser/resultados-fev26/requests.txt') }}"
+
+  tasks:
+    - name: Run command async
+      ansible.builtin.command:
+        cmd: >-
+          python3 {{ ansible_env.HOME }}/kv-python-benchmark/main.py
+          {{ num_threads }}
+          {{ num_clients }}
+          {{ seconds }}
+          {{ server_url }}
+          {{ file_to_write + '/' + num_clients + '_clients_' + num_threads + '_threads_' + thinking_time + '_thinking.txt' }}
+          {{ main_client }}
+          {{ should_populate_database }}
+          {{ debug_response }}
+          {{ thinking_time }}
+          {{ save_all_requests }}
+          {{ reproduce_requests }}
+          {{ file_to_write_requests }}
+      async: "{{ seconds | int + 120 }}"
+      poll: 0
+      register: client_job
+
+- name: Kill pod at halfway point
+  hosts: worker
+  vars:
+    seconds: "{{ lookup('ansible.builtin.env', 'SECONDS_TO_RUN', default='800') }}"
+
+  tasks:
+    - name: Wait half the experiment time
+      ansible.builtin.pause:
+        seconds: "{{ (seconds | int / 2) | int }}"
+
+    - name: Get pod name
+      ansible.builtin.command:
+        cmd: kubectl get pod -l app=kv-test -o jsonpath='{.items[0].metadata.name}'
+      register: pod_name
+
+    - name: Delete pod
+      ansible.builtin.command:
+        cmd: kubectl delete pod {{ pod_name.stdout }}
+
+- name: Wait for clients to finish
+  hosts: client_master, client_nodes
+  vars:
+    seconds: "{{ lookup('ansible.builtin.env', 'SECONDS_TO_RUN', default='800') }}"
+
+  tasks:
+    - name: Wait for async job
+      ansible.builtin.async_status:
+        jid: "{{ client_job.ansible_job_id }}"
+      register: job_result
+      until: job_result.finished
+      retries: "{{ (seconds | int + 120) // 10 }}"
+      delay: 10

@@ -1,0 +1,291 @@
+================================================================================
+IMPLEMENTATION DETAILS — Kubernetes checkpoint/restore (C/R) testbed
+================================================================================
+Purpose: reference of the exact software stack, versions, flags and
+configuration used in the experiments, for the methodology / reproducibility
+section of a scientific article.
+
+All version numbers below were read live from the running nodes (not from
+documentation). Where a value is set by a script in this repository, the script
+is named so it can be cited.
+
+--------------------------------------------------------------------------------
+1. TESTBED / HARDWARE
+--------------------------------------------------------------------------------
+- Platform: Emulab (CloudLab-class bare-metal testbed).
+- Profile: k8s-calico-cni (Ubuntu 24), experiment "scalablesmr".
+- Node roles (one bare-metal machine each):
+    * Control plane  (1 node)
+    * Worker         (1 node)   <- all C/R activity happens here
+    * Registry       (1 node)   <- private OCI registry
+    * Load clients   (up to 10 nodes) running the HTTP benchmark
+- Experimental network: flat L2 segment, 10.10.1.0/24.
+    control-plane = 10.10.1.1
+    worker        = 10.10.1.2
+    registry      = 10.10.1.3
+    clients       = 10.10.1.4 .. 10.10.1.x
+  (Control/management traffic uses the public Emulab interface; all cluster and
+   benchmark traffic uses the 10.10.1.0/24 experimental interface.)
+
+--------------------------------------------------------------------------------
+2. OPERATING SYSTEM
+--------------------------------------------------------------------------------
+- Distribution : Ubuntu 24.04.2 LTS
+- Kernel       : 6.8.0-62-generic (x86_64)
+
+--------------------------------------------------------------------------------
+3. CONTAINER RUNTIME (CRI) AND C/R ENGINE
+--------------------------------------------------------------------------------
+- CRI                : CRI-O v1.32.5 (GitCommit 9607a04c08867b45711fa0f844a640250bff9460)
+                       CRI socket: unix:///var/run/crio/crio.sock
+- OCI runtime        : runc 1.3.0   (the real binary, kept at /usr/libexec/crio/runc.bin)
+- Checkpoint engine  : CRIU 4.1
+- Image build (daemon side, in-container): buildah (commit straight to registry)
+- Registry runtime   : Docker registry (distribution) container, TLS on :5000
+
+Kubernetes uses CRI-O (NOT containerd / Docker) as the container runtime. The
+kubelet-driven container checkpoint feature delegates to CRI-O, which calls runc,
+which calls CRIU.
+
+3.1 CRI-O configuration changes (applied by scripts/setup-worker.sh)
+--------------------------------------------------------------------------------
+(a) signature_policy disabled:
+    File: /etc/crio/crio.conf.d/10-crio.conf
+    Change: signature_policy = ""
+    Reason: the Emulab profile ships signature_policy = "/etc/crio/policy.json".
+    CRI-O refuses the checkpoint-RESTORE path whenever ANY namespaced signature
+    policy is defined — even a permissive insecureAcceptAnything policy — failing
+    with: "namespaced signature policy /etc/crio/policy.json defined for pods in
+    namespace default". Setting it to empty is required for restore to proceed.
+
+(b) runc wrapper that injects CRIU flags:
+    CRI-O 1.32 hard-codes the argument list it passes to `runc checkpoint` and
+    `runc restore` and never forwards the CRIU options we need. We install a bash
+    wrapper at /usr/libexec/crio/runc (the original ELF is moved to runc.bin) that
+    inspects the runc subcommand and appends flags before exec'ing the real runc:
+
+        on `checkpoint` : --tcp-skip-in-flight --ext-unix-sk
+        on `restore`    : --ext-unix-sk
+
+    --tcp-skip-in-flight  : without it, under concurrent TCP load the checkpoint
+                            fails deterministically with
+                            "criu/sk-inet.c:176: inet: In-flight connection (l)".
+    --ext-unix-sk         : allow checkpoint/restore of external unix sockets.
+    NOTE — --tcp-established is deliberately NOT injected (see 3.2).
+
+3.2 CRIU configuration (applied by scripts/setup-worker.sh)
+--------------------------------------------------------------------------------
+    File: /etc/criu/default.conf  (CRIU reads this by default)
+    Content: tcp-close
+
+    Rationale (important design point for the paper):
+    The container is checkpointed while the application keeps a pool of
+    established keep-alive TCP connections (interceptor -> kv-test:3000). Two
+    options exist for those established connections:
+      * --tcp-established : CRIU dumps and tries to RE-ESTABLISH the connections
+        on restore. Because the restored pod gets a NEW IP, restore fails with
+        "soccr: Can't bind inet socket back: Cannot assign requested address".
+      * tcp-close (chosen): CRIU does NOT dump the established connections; it
+        closes them at dump time, and the pod restores cleanly on the new IP. The
+        application layer re-establishes connections after restore.
+    Trade-off: with --tcp-established CRIU freezes connections during the dump,
+    producing ~1s latency spikes at the p99.9 of in-flight requests; tcp-close
+    avoids this at the cost of dropping established connections across the C/R.
+
+    CRI-O service is restarted after these changes.
+
+--------------------------------------------------------------------------------
+4. KUBERNETES
+--------------------------------------------------------------------------------
+- kubeadm init target version : v1.32.8   (--kubernetes-version, scripts/setup-control-plane.sh)
+- Server (API) version        : v1.32.8
+- kubelet / kubectl client    : v1.32.6
+- Bootstrap tool              : kubeadm
+- Pod network CIDR            : 192.168.0.0/16
+- API server advertise addr   : the node's 10.10.1.x experimental IP
+- CRI socket                  : unix:///var/run/crio/crio.sock
+
+4.1 Control-plane init (scripts/setup-control-plane.sh)
+    Idempotent: if the CP node is already Ready under the current experiment
+    hostname, it skips reinit and only runs `kubeadm token create`. Otherwise:
+      kubeadm reset --cri-socket=unix:///var/run/crio/crio.sock
+      rm -rf /etc/cni/net.d ; iptables -F / -t nat -F / -t mangle -F / -X
+      kubeadm init --apiserver-advertise-address=<CP 10.10.1.x> \
+                   --pod-network-cidr=192.168.0.0/16 \
+                   --kubernetes-version=v1.32.8 \
+                   --cri-socket=unix:///var/run/crio/crio.sock
+    A fresh init is required between Emulab experiments because kubelet certs are
+    tied to the previous hostname.
+
+4.2 Worker join (scripts/setup-worker.sh)
+    Standard `kubeadm join` using the token/CA hash printed by the CP. Preceded by
+    `kubeadm reset` for idempotent re-joins.
+
+--------------------------------------------------------------------------------
+5. CNI (POD NETWORKING)
+--------------------------------------------------------------------------------
+- Primary CNI : Calico v3.28.0
+    Manifest: https://raw.githubusercontent.com/projectcalico/calico/v3.28.0/manifests/calico.yaml
+    Image: docker.io/calico/node:v3.28.0
+- Meta-CNI / multi-NIC : Multus CNI (thick plugin)
+    Image: ghcr.io/k8snetworkplumbingwg/multus-cni:snapshot-thick
+    Manifest: multus-daemonset-thick.yml (upstream master)
+- Secondary network (Multus NetworkAttachmentDefinition "macvlan-network"):
+    type   : macvlan, mode bridge
+    master : eno1
+    ipam   : host-local, subnet 192.168.1.0/24, range .100-.102, gw 192.168.1.1
+    cniVersion: 0.3.1
+
+--------------------------------------------------------------------------------
+6. PRIVATE IMAGE REGISTRY
+--------------------------------------------------------------------------------
+- Runtime  : Docker `registry` (distribution) container, name "myregistry"
+- Endpoint : 10.10.1.3:5000  (TLS; certs under /home/registry/certs)
+- Storage  : /home/registry/images
+- Run cmd  : docker run -d --restart=always --name myregistry -p 5000:5000 \
+                -v /home/registry/images:/var/lib/registry \
+                -v /home/registry/certs:/certs \
+                -e REGISTRY_HTTP_TLS_CERTIFICATE=/certs/domain.crt \
+                -e REGISTRY_HTTP_TLS_KEY=/certs/domain.key registry
+- Images pushed (scripts/setup-registry.sh):
+    10.10.1.3:5000/rodrigohmuller/kv-test:latest
+    10.10.1.3:5000/rodrigohmuller/kv-test:base-v1     (stable rootfs tag, see 8)
+    10.10.1.3:5000/rodrigohmuller/interceptor-grpc:latest
+  Both application images are built from source with `docker build` on the
+  registry node and pushed before the cluster consumes them.
+
+--------------------------------------------------------------------------------
+7. WORKLOADS
+--------------------------------------------------------------------------------
+7.1 kv-test (the checkpointed application — in-memory key/value store, Go/Fiber)
+    - Deployment: kv-test-deployment, replicas: 1
+    - Image: 10.10.1.3:5000/rodrigohmuller/kv-test:latest
+    - Container port: 3000  (env PORT=":3000")
+    - Resources (request == limit): cpu "0.5", memory "3Gi"
+    - Pod annotation: io.kubernetes.cri-o.image-name pinned to the registry image
+    - hostPath volume for logs under /tmp/logs (chmod 777; container runs as
+      non-root appuser)
+
+7.2 interceptor-grpc (request interceptor / snapshot coordinator, Go)
+    - Deployment: interceptor, replicas: 1
+    - Image: 10.10.1.3:5000/rodrigohmuller/interceptor-grpc (imagePullPolicy: Always)
+    - Ports: 3000 (HTTP data plane), 51100 (gRPC reply/snapshot control plane)
+    - Pod securityContext sysctl: net.ipv4.ip_local_port_range = "1024 65535"
+      (ephemeral-port exhaustion mitigation at the pod, see 9/10)
+    - Key environment variables:
+        INTERCEPTOR_PORT      = "3000"
+        GRPC_URL              = ":51100"        (interceptor's gRPC server)
+        HOST                  = "10.10.1.2"     (worker)
+        APPLICATION_URL       = "http://10.10.1.2:<kv-test NodePort>"
+        DAEMON_GRPC_URL       = "10.10.1.2:50051"  (calls the C/R daemon)
+        CHECKPOINT_ENABLED    = "false" | "true"   (toggled per experiment)
+        CHECKPOINT_INTERVAL   = seconds between periodic snapshots (e.g. 240-500)
+        HEARTBEAT_ENABLED     = "true"
+        HEARTBEAT_PATH        = "health"
+        SNAPSHOT_DRAIN_TIMEOUT= seconds (default 30) — in-flight drain budget
+        NAMESPACE/SERVICE_NAME/CONTAINER_NAME/POD_NAME = default / kv-test
+        REGISTRY_NAME         = "10.10.1.3:5000"
+    - Services exposed as NodePort (run-interceptor.sh): name=http port 3000,
+      name=grpc port 51100.
+
+--------------------------------------------------------------------------------
+8. CHECKPOINT/RESTORE SNAPSHOT DAEMON (k8s-cr-daemon)
+--------------------------------------------------------------------------------
+- Runs on the WORKER host (not in-cluster), supervised by supervisord
+  (/etc/supervisor/conf.d/k8s-cr-daemon.conf), binary at
+  /home/k8s-cr-daemon-exec/k8s-cr-exec.
+- Source: git@github.com:r-hmuller/k8s-cr-daemon.git (branch main), rebuilt from
+  source on the worker with Go 1.24.4 (scripts/setup-worker.sh). The shipped
+  binary uses proto package "snapshot_rpc" while the interceptor expects "protos",
+  which causes gRPC Unimplemented — hence the rebuild.
+- gRPC server: :50051 (CR_DAEMON_GRPC_PORT).
+
+8.1 Daemon environment (supervisor `environment=` line)
+    CR_DAEMON_KUBECONFIG_PATH = /home/k8s-cr-daemon-exec/imported_keys/admin.conf
+    CR_DAEMON_K8S_IP          = 10.10.1.2 (worker experimental IP)
+    CR_DAEMON_KUBELET_API     = localhost:10250
+    CR_DAEMON_GRPC_PORT       = :50051
+    CR_DAEMON_KUBELET_CERT    = .../imported_keys/apiserver-kubelet-client.crt
+    CR_DAEMON_KUBELET_KEY     = .../imported_keys/apiserver-kubelet-client.key
+    CR_DAEMON_KUBELET_CA      = /etc/kubernetes/pki/ca.crt
+    CR_DAEMON_PRIVATE_REGISTRY_URL = 10.10.1.3:5000
+    CR_DAEMON_BASE_IMAGE      = 10.10.1.3:5000/rodrigohmuller/kv-test:base-v1
+    CR_DAEMON_REPLY_TARGET    = 10.10.1.2:<interceptor grpc NodePort>
+                                (set by run-interceptor.sh once the NodePort
+                                 exists; the daemon log.Fatals without it)
+
+8.2 Certificate sync (scripts/sync-daemon-certs.sh)
+    Because kubeadm init regenerates the CA each experiment, admin.conf and
+    apiserver-kubelet-client.{crt,key} are copied from the CP into the daemon's
+    imported_keys/ on the worker, otherwise the daemon's API calls fail x509.
+
+8.3 Snapshot pipeline (high level)
+    interceptor --(gRPC CreateSnapshot)--> daemon
+      -> kubelet container checkpoint (non-destructive; CRIU dump via CRI-O/runc)
+      -> build OCI image from the checkpoint tar with buildah, committing STRAIGHT
+         to the registry:
+            buildah commit --disable-compression --tls-verify=false \
+                           --format oci <ctr> docker://<registryImage>
+         (direct commit eliminates a local materialise + re-read; ~22% faster)
+      -> push to registry (:latest)
+      -> daemon Reply("completed") to the interceptor — ONLY after the push is
+         confirmed in the registry (durability invariant).
+    Restore = `kubectl rollout restart deploy/kv-test-deployment`: the new pod
+    pulls :latest, CRI-O detects the checkpoint image and restores it via CRIU.
+
+8.4 base-v1 stable rootfs tag (why it exists)
+    On CRI-O 1.32 the restored container's status.Image is resolved from the
+    repoTags of the rootfs image in local storage. The snapshot loop overwrites
+    the :latest tag on every snapshot, which could leave the base rootfs without a
+    repoTag -> status.Image unset -> pod NotReady -> Service stops routing. A
+    stable, never-overwritten tag (kv-test:base-v1) is used as the daemon's
+    rootfsImageRef so CRI-O always finds a named base image at restore time.
+
+--------------------------------------------------------------------------------
+9. LOAD GENERATION (CLIENTS)
+--------------------------------------------------------------------------------
+- Up to 10 Emulab nodes drive HTTP load against the interceptor's HTTP NodePort
+  (http://10.10.1.2:<port>), orchestrated via Ansible (run-*.sh).
+- Client TCP tuning (re-applied each experiment; nodes are re-imaged), to avoid
+  ephemeral-port exhaustion during long interceptor blocking windows:
+        sysctl net.ipv4.ip_local_port_range = "1024 65535"
+        sysctl net.ipv4.tcp_tw_reuse = 1
+- Benchmark records per-request: timestamp, latency, HTTP status.
+
+--------------------------------------------------------------------------------
+10. INFRASTRUCTURE WORKAROUNDS (Emulab re-image artifacts; not part of the system
+    under test, but documented for reproducibility)
+--------------------------------------------------------------------------------
+(a) SSH host keys: re-imaged nodes change host keys; clear with
+    `ssh-keygen -R node1.example.net` before reconnecting.
+(b) Calico CNI race: after kubeadm init + Calico, coredns / calico-kube-controllers
+    can hang in ContainerCreating ("no CNI configuration file in /etc/cni/net.d/")
+    even though 10-calico.conflist exists — CRI-O does not reload its CNI watch.
+    Fix: restart crio then kubelet on the CP and delete the stuck pods.
+(c) Duplicate experimental IP: in some node mappings Emulab assigns the registry
+    IP (10.10.1.3) ALSO to a client node, so two hosts answer ARP on the segment
+    (`arping 10.10.1.3` returns two replies). The worker may cache the wrong MAC
+    and the registry pull/push gets a TCP RST. Mitigation (orchestrator.sh):
+    resolve the registry's real MAC on the registry node and pin a static ARP
+    entry on the worker (`ip neigh replace 10.10.1.3 lladdr <mac> dev <dev>
+    nud permanent`). Side effect: the client that holds the duplicate IP becomes
+    unusable as a load client and must be excluded.
+
+--------------------------------------------------------------------------------
+11. VERSION SUMMARY (copy-paste for a "Software" table in the paper)
+--------------------------------------------------------------------------------
+    Component            Version
+    -------------------  ---------------------------
+    OS                   Ubuntu 24.04.2 LTS
+    Kernel               6.8.0-62-generic
+    Kubernetes (server)  v1.32.8
+    kubeadm              v1.32.8
+    kubelet/kubectl      v1.32.6
+    CRI                  CRI-O 1.32.5
+    OCI runtime          runc 1.3.0
+    Checkpoint engine    CRIU 4.1
+    CNI                  Calico v3.28.0
+    Meta-CNI             Multus (thick, snapshot)
+    Registry             Docker distribution registry (TLS, :5000)
+    Daemon build         Go 1.24.4
+================================================================================

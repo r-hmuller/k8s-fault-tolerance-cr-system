@@ -60,9 +60,17 @@ checkpoint/restore events.
 | `interceptor-grpc/` | Go | Request proxy and checkpoint/restore controller |
 | `k8s-cr-daemon/`    | Go | Node-level CRIU/CRI-O checkpoint/restore daemon |
 | `kv-python-benchmark/` | Python | Workload and benchmark client |
+| `deploy-experiments/` | Shell / Ansible / Python | Cluster provisioning, deployment, benchmark campaigns and analysis |
 
 Each component keeps its own build files (`go.mod` / `requirements.txt`) and can
 be built independently from its subdirectory.
+
+## Reproducing the experiments
+
+See [`TESTING.md`](TESTING.md) for the end-to-end walkthrough (testbed topology,
+prerequisites, deployment, benchmark invocation and output format). The
+automation that drives our runs lives in
+[`deploy-experiments/`](deploy-experiments/).
 
 ## Citation
 

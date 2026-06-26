@@ -1,0 +1,24 @@
+- name: Install SSH key on client nodes and clone git repo
+  hosts: client_nodes,client_master
+  tasks:
+    - name: Install git
+      ansible.builtin.dnf:
+        name: git
+        state: present
+
+    - name: Copy file with owner and permissions
+      ansible.builtin.copy:
+        src: /home/rodrigomuller/.ssh/id_rsa_servidores
+        dest: /root/.ssh/id_rsa_servidores
+        owner: root
+        group: root
+        mode: "0600"
+
+    - name: Clone git repo
+      ansible.builtin.git:
+        repo: https://github.com/r-hmuller/kv-python-benchmark.git
+        dest: /root/kv-python-benchmark
+
+    - name: Install requirements
+      ansible.builtin.command:
+        cmd: pip3 install -r /root/kv-python-benchmark/requirements.txt
