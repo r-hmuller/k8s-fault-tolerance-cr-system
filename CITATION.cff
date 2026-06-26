@@ -4,6 +4,7 @@ title: "k8s-fault-tolerance-cr-system: Fault tolerance for stateful Kubernetes p
 authors:
   - family-names: "Müller"
     given-names: "Rodrigo Herpich"
+    orcid: "https://orcid.org/0000-0002-5035-6027"
 repository-code: "https://github.com/r-hmuller/k8s-fault-tolerance-cr-system"
 url: "https://github.com/r-hmuller/k8s-fault-tolerance-cr-system"
 version: "1.0.0"
