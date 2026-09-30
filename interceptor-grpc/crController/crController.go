@@ -108,7 +108,16 @@ func (s *server) Reply(_ context.Context, replySnapshot *protos.ReplySnapshotReq
 		Uint64("latestRequest", replySnapshot.LatestRequest).
 		Msg("Snapshot Reply received from daemon")
 
-	config.UpdateRequestsToSnapshoted(replySnapshot.LatestRequest)
+	// Só um snapshot concluído contém as requisições. Num "failed", marcá-las
+	// como Snapshoted faria o ClearRequestsMap descartá-las, e um restore
+	// posterior (de um checkpoint mais antigo) as perderia sem replay.
+	if replySnapshot.SnapshotStatus == "completed" {
+		config.UpdateRequestsToSnapshoted(replySnapshot.LatestRequest)
+	} else {
+		log.Warn().
+			Str("status", replySnapshot.SnapshotStatus).
+			Msg("Snapshot not completed: buffered requests stay reprocessable")
+	}
 
 	IsDoingSnapshot.Store(false)
 	config.SnapshotLock.Lock()
