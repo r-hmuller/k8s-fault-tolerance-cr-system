@@ -2,6 +2,7 @@ package interceptor
 
 import (
 	"bytes"
+	"context"
 	"crypto/tls"
 	"errors"
 	"interceptor-grpc/config"
@@ -18,10 +19,6 @@ import (
 var lock = &sync.RWMutex{}
 var singleInstance *http.Client
 
-// drainSlots limita a concorrência da drenagem da fila (replay pós-recuperação
-// pode ter dezenas de milhares de entradas; sem limite inundaria a aplicação).
-var drainSlots = make(chan struct{}, 32)
-
 // Tempo máximo que um request enfileirado espera o ciclo de recuperação
 // (snapshot/restore + drenagem da fila). Igual ao timeout do spin-gate.
 const queueWaitTimeout = 5 * time.Minute
@@ -36,8 +33,16 @@ type QueueHttpRequest struct {
 }
 
 func ProcessQueue() {
+	processQueue(context.Background())
+}
+
+func processQueue(ctx context.Context) {
 	for {
-		time.Sleep(50 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
 
 		// Skip processing if container is unavailable, but don't exit the loop
 		if crController.IsContainerUnavailable.Load() {
@@ -56,35 +61,36 @@ func ProcessQueue() {
 			continue
 		}
 
-		// Drena a fila inteira, não 1 item por tick: após uma recuperação o
-		// replay pode enfileirar dezenas de milhares de entradas, e 1/50ms
-		// (20/s) não escala. Concorrência limitada por drainSlots pra não
-		// inundar a aplicação.
+		// Drena a fila em ordem, aguardando a resposta de cada envio antes de
+		// retirar o próximo item. Não há pausa de 50ms entre os itens: o tick
+		// serve somente para esperar enquanto a fila está vazia ou bloqueada.
+		// Requisições normais continuam paralelas quando a fila está vazia.
 		for QueueLength.Load() > 0 {
+			if ctx.Err() != nil {
+				return
+			}
 			if crController.IsDoingSnapshot.Load() || crController.IsRestoringSnapshot.Load() ||
 				crController.IsContainerUnavailable.Load() {
 				break
 			}
+			// Marca a drenagem antes de retirar o item. Assim, mesmo o último
+			// item continua protegendo a fila enquanto aguarda sua resposta.
+			crController.IsRunningPendingRequestQueue.Store(true)
 			request, err := GetRequestFromQueue()
 			if err != nil {
 				break
 			}
-			crController.IsRunningPendingRequestQueue.Store(true)
-
-			drainSlots <- struct{}{}
 			crController.InFlightRequests.Add(1)
-			go func(item QueueHttpRequest) {
-				defer func() {
-					<-drainSlots
-					crController.InFlightRequests.Done()
-				}()
-				res := forwardBuffered(item.Data)
-				if item.RespCh != nil {
-					// Canal buffered(1): se o handler já desistiu (timeout/
-					// desconexão), o send não bloqueia e o resultado é descartado.
-					item.RespCh <- res
-				}
-			}(request)
+			res := forwardBuffered(request.Data)
+			crController.InFlightRequests.Done()
+			if request.RespCh != nil {
+				// Canal buffered(1): se o handler já desistiu (timeout/
+				// desconexão), o send não bloqueia e o resultado é descartado.
+				request.RespCh <- res
+			}
+		}
+		if QueueLength.Load() == 0 {
+			crController.IsRunningPendingRequestQueue.Store(false)
 		}
 	}
 }
@@ -119,7 +125,8 @@ func Handler(w http.ResponseWriter, r *http.Request) {
 		Body:   body,
 	}
 
-	if crController.IsUnavailable() {
+	if crController.IsUnavailable() || QueueLength.Load() > 0 ||
+		crController.IsRunningPendingRequestQueue.Load() {
 		// Fila de recuperação: o handler fica bloqueado esperando o resultado
 		// pelo canal — é ele quem escreve a resposta, nunca o worker. Sem isso
 		// o net/http finaliza a resposta como 200 vazio assim que o handler
@@ -206,30 +213,30 @@ func sendRequest(data config.RequestData, uuid uint64) config.Result {
 }
 
 func getHttpClient() *http.Client {
+	// Handler pode enviar requisições normais em paralelo, e DrainConnections
+	// pode substituir o cliente. Toda leitura e escrita usa o mesmo mutex.
+	lock.Lock()
+	defer lock.Unlock()
 	if singleInstance == nil {
-		lock.Lock()
-		if singleInstance == nil {
-			tr := &http.Transport{
-				MaxIdleConns: 0,
-				// 4096 (era 200): no flush pós-snapshot o interceptor abre
-				// milhares de conexões simultâneas pro kv; com pool pequeno o
-				// excedente é FECHADO após o uso e vira TIME_WAIT (60s) no
-				// lado do interceptor → as ~28K portas efêmeras do pod esgotam
-				// (EADDRNOTAVAIL) e até health/canário param de conseguir
-				// discar. Pool grande = reuso em vez de churn.
-				MaxIdleConnsPerHost: 4096,
-				IdleConnTimeout:     90 * time.Second,
-				DisableCompression:  true,
-				TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
-				// Keep-alive ativo durante operação normal para evitar overhead de
-				// TCP handshake por request. Conexões são drenadas explicitamente em
-				// DrainConnections() antes de cada checkpoint (CRIU requer zero
-				// conexões TCP abertas no momento do dump).
-				DisableKeepAlives: false,
-			}
-			singleInstance = &http.Client{Transport: tr}
+		tr := &http.Transport{
+			MaxIdleConns: 0,
+			// 4096 (era 200): no flush pós-snapshot o interceptor abre
+			// milhares de conexões simultâneas pro kv; com pool pequeno o
+			// excedente é FECHADO após o uso e vira TIME_WAIT (60s) no
+			// lado do interceptor → as ~28K portas efêmeras do pod esgotam
+			// (EADDRNOTAVAIL) e até health/canário param de conseguir
+			// discar. Pool grande = reuso em vez de churn.
+			MaxIdleConnsPerHost: 4096,
+			IdleConnTimeout:     90 * time.Second,
+			DisableCompression:  true,
+			TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
+			// Keep-alive ativo durante operação normal para evitar overhead de
+			// TCP handshake por request. Conexões são drenadas explicitamente em
+			// DrainConnections() antes de cada checkpoint (CRIU requer zero
+			// conexões TCP abertas no momento do dump).
+			DisableKeepAlives: false,
 		}
-		lock.Unlock()
+		singleInstance = &http.Client{Transport: tr}
 	}
 	return singleInstance
 }
